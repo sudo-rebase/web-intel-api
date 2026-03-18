@@ -1,0 +1,24 @@
+[project]
+name = "web-intel-api"
+version = "1.0.0"
+description = "Web Intelligence API — Extract structured JSON from any URL. Built for AI agents."
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.10",
+    "httpx>=0.28",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.3",
+    "trafilatura>=2.0",
+    "python-dateutil>=2.9",
+    "playwright>=1.49",
+    "python-multipart>=0.0.18",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["app"]
