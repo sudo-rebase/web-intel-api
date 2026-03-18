@@ -19,11 +19,11 @@ RUN pip install --no-cache-dir \
     "lxml>=5.3" \
     "trafilatura>=2.0" \
     "python-dateutil>=2.9" \
+    "playwright>=1.49" \
     "python-multipart>=0.0.18"
 
-# Note: playwright/Chromium is ~1GB and optional (render_js=false by default).
-# JS rendering is available but not pre-installed in this image.
-# To enable: rebuild with playwright install chromium --with-deps
+# Install Chromium for full JS rendering support (React/Vue/Angular pages)
+RUN playwright install chromium --with-deps
 
 COPY app.py .
 

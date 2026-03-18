@@ -12,6 +12,7 @@ dependencies = [
     "lxml>=5.3",
     "trafilatura>=2.0",
     "python-dateutil>=2.9",
+    "playwright>=1.49",
     "python-multipart>=0.0.18",
 ]
 
