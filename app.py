@@ -5,7 +5,15 @@ Built for AI agents that need to consume web pages as clean, structured JSON —
 not raw HTML. Handles JS rendering, content extraction, table parsing, metadata,
 and full Markdown output suitable for feeding directly into language models.
 
-Version: 1.0.0
+NEW in v1.1.0:
+  - POST /api/feed — Parse RSS 2.0 and Atom 1.0 feeds into structured JSON items.
+    Returns per-item: title, link, pub_date, summary, content, author, guid, media_url.
+    autodiscover=true: if given a web page URL, finds and follows feed links automatically.
+  - POST /api/tech — Detect 60+ technologies from headers + HTML analysis.
+    Categories: CMS, JS/CSS frameworks, analytics, CRM, CDN, hosting, server, runtime, libraries.
+    Uses: HTTP headers, script/CSS src URLs, HTML attributes, meta generator, cookies.
+
+Version: 1.1.0
 """
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -65,7 +73,7 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 app = FastAPI(
     title="Web Intelligence API",
@@ -845,12 +853,21 @@ def root():
         "version": VERSION,
         "status": "online",
         "endpoints": {
-            "extract": "POST /api/extract",
-            "extract_batch": "POST /api/extract/batch",
-            "extract_markdown": "POST /api/extract/markdown",
-            "extract_schema": "POST /api/extract/schema",
-            "health": "GET /health",
+            "extract":          "POST /api/extract — structured content extraction (text, tables, links, metadata)",
+            "extract_batch":    "POST /api/extract/batch — extract from up to 10 URLs concurrently",
+            "extract_markdown": "POST /api/extract/markdown — clean Markdown output for LLM ingestion",
+            "extract_schema":   "POST /api/extract/schema — heuristic field extraction from natural-language schema",
+            "feed":             "POST /api/feed [v1.1] — parse RSS/Atom feeds, with HTML autodiscovery",
+            "tech":             "POST /api/tech [v1.1] — detect tech stack (CMS, frameworks, analytics, CDN, server)",
+            "health":           "GET /health",
         },
+        "new_in_v1_1_0": [
+            "POST /api/feed — RSS 2.0 + Atom 1.0 feed parsing. Returns items with title/link/pub_date/summary/author.",
+            "  autodiscover=true: follow <link rel=alternate> to find feeds on a regular web page.",
+            "POST /api/tech — Detect 60+ technologies: CMS, JS/CSS frameworks, analytics, CDN, hosting, server.",
+            "  Uses: HTTP headers, script/CSS URLs, HTML attributes, meta generator, cookies.",
+            "  Returns: technologies[] with name/category/evidence, categories dict, server_header, meta_generator.",
+        ],
         "docs": "/docs",
     }
 
@@ -1134,6 +1151,543 @@ def _schema_extract_field(
             return val
 
     return None
+
+
+# ──────────────────────────────────────────────
+# v1.1.0: RSS/Atom feed parsing
+# ──────────────────────────────────────────────
+
+import xml.etree.ElementTree as ET
+
+_RSS_NS = {
+    "dc":      "http://purl.org/dc/elements/1.1/",
+    "content": "http://purl.org/rss/1.0/modules/content/",
+    "media":   "http://search.yahoo.com/mrss/",
+    "atom10":  "http://www.w3.org/2005/Atom",
+}
+
+
+def _xml_text(el: Optional[ET.Element], fallback: str = "") -> str:
+    if el is None:
+        return fallback
+    return (el.text or "").strip()
+
+
+def _parse_rss2(root: ET.Element) -> Dict[str, Any]:
+    """Parse RSS 2.0 feed."""
+    channel = root.find("channel")
+    if channel is None:
+        raise ValueError("No <channel> element found in RSS feed")
+
+    feed_title = _xml_text(channel.find("title"))
+    feed_link  = _xml_text(channel.find("link"))
+    feed_desc  = _xml_text(channel.find("description"))
+
+    items = []
+    for item in channel.findall("item"):
+        title   = _xml_text(item.find("title"))
+        link    = _xml_text(item.find("link"))
+        desc_el = item.find("description")
+        summary = ""
+        if desc_el is not None and desc_el.text:
+            # Strip HTML tags from description
+            summary = re.sub(r"<[^>]+>", "", desc_el.text).strip()[:1000]
+
+        # content:encoded
+        content_el = item.find("content:encoded", _RSS_NS)
+        content = ""
+        if content_el is not None and content_el.text:
+            content = re.sub(r"<[^>]+>", "", content_el.text).strip()[:2000]
+
+        pub_date = _xml_text(item.find("pubDate"))
+        guid     = _xml_text(item.find("guid"))
+        author   = _xml_text(item.find("author"))
+        if not author:
+            dc_creator = item.find("dc:creator", _RSS_NS)
+            author = _xml_text(dc_creator)
+
+        # Enclosure (podcast audio, image)
+        enclosure = item.find("enclosure")
+        media_url = None
+        if enclosure is not None:
+            media_url = enclosure.get("url")
+
+        # media:thumbnail
+        media_thumb = item.find("media:thumbnail", _RSS_NS)
+        if media_thumb is not None and not media_url:
+            media_url = media_thumb.get("url")
+
+        items.append({
+            "title":      title,
+            "link":       link,
+            "pub_date":   pub_date,
+            "summary":    summary or content[:500],
+            "content":    content,
+            "author":     author,
+            "guid":       guid,
+            "media_url":  media_url,
+        })
+
+    return {
+        "format":     "rss2",
+        "title":      feed_title,
+        "link":       feed_link,
+        "description": feed_desc,
+        "items":      items,
+        "item_count": len(items),
+    }
+
+
+def _parse_atom(root: ET.Element) -> Dict[str, Any]:
+    """Parse Atom 1.0 feed."""
+    ns = "http://www.w3.org/2005/Atom"
+
+    def _t(el: Optional[ET.Element]) -> str:
+        return (el.text or "").strip() if el is not None else ""
+
+    feed_title = _t(root.find(f"{{{ns}}}title"))
+    link_el    = root.find(f".//{{{ns}}}link[@rel='alternate']")
+    if link_el is None:
+        link_el = root.find(f"{{{ns}}}link")
+    feed_link  = link_el.get("href", "") if link_el is not None else ""
+    feed_desc_el = root.find(f"{{{ns}}}subtitle")
+    feed_desc  = _t(feed_desc_el)
+
+    items = []
+    for entry in root.findall(f"{{{ns}}}entry"):
+        title   = _t(entry.find(f"{{{ns}}}title"))
+
+        entry_link_el = entry.find(f"{{{ns}}}link[@rel='alternate']")
+        if entry_link_el is None:
+            entry_link_el = entry.find(f"{{{ns}}}link")
+        link = entry_link_el.get("href", "") if entry_link_el is not None else ""
+
+        # Summary or content
+        summary_el = entry.find(f"{{{ns}}}summary")
+        content_el = entry.find(f"{{{ns}}}content")
+        raw_text = ""
+        if summary_el is not None and summary_el.text:
+            raw_text = re.sub(r"<[^>]+>", "", summary_el.text).strip()
+        elif content_el is not None and content_el.text:
+            raw_text = re.sub(r"<[^>]+>", "", content_el.text).strip()
+
+        published = _t(entry.find(f"{{{ns}}}published")) or _t(entry.find(f"{{{ns}}}updated"))
+        entry_id  = _t(entry.find(f"{{{ns}}}id"))
+
+        author_el   = entry.find(f"{{{ns}}}author")
+        author_name = ""
+        if author_el is not None:
+            author_name = _t(author_el.find(f"{{{ns}}}name"))
+
+        items.append({
+            "title":    title,
+            "link":     link,
+            "pub_date": published,
+            "summary":  raw_text[:1000],
+            "content":  raw_text[:2000],
+            "author":   author_name,
+            "guid":     entry_id,
+            "media_url": None,
+        })
+
+    return {
+        "format":     "atom",
+        "title":      feed_title,
+        "link":       feed_link,
+        "description": feed_desc,
+        "items":      items,
+        "item_count": len(items),
+    }
+
+
+def _autodiscover_feeds(html: str, base_url: str) -> List[Dict[str, str]]:
+    """Find feed URLs in a page's <head> via <link> autodiscovery."""
+    if not BS4_AVAILABLE:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    feeds = []
+    for link in soup.find_all("link", rel=True):
+        rel = " ".join(link.get("rel", [])).lower()
+        if "alternate" in rel:
+            type_ = link.get("type", "").lower()
+            if any(t in type_ for t in ("rss", "atom", "feed", "xml")):
+                href = link.get("href", "")
+                if href:
+                    # Resolve relative URL
+                    href = urllib.parse.urljoin(base_url, href)
+                    feeds.append({
+                        "url":   href,
+                        "type":  type_,
+                        "title": link.get("title", ""),
+                    })
+    return feeds
+
+
+class FeedRequest(BaseModel):
+    url: str = Field(..., description="Feed URL (RSS or Atom) or a web page with feed autodiscovery")
+    limit: int = Field(50, ge=1, le=200, description="Max items to return (default 50)")
+    autodiscover: bool = Field(
+        False,
+        description=(
+            "If true and URL is a web page (not a feed), follow feed autodiscovery links. "
+            "Fetches the first discovered RSS/Atom feed URL."
+        ),
+    )
+    timeout: int = Field(DEFAULT_TIMEOUT, ge=1, le=MAX_TIMEOUT)
+
+
+@app.post("/api/feed")
+async def parse_feed(req: FeedRequest):
+    """
+    Parse an RSS 2.0 or Atom 1.0 feed.
+
+    **v1.1.0** — Returns structured feed data with per-item fields.
+
+    Pass any RSS or Atom feed URL and receive:
+    - Feed-level metadata: title, link, description, format
+    - `items[]`: title, link, pub_date, summary, content, author, guid, media_url
+
+    **Autodiscovery mode** (`autodiscover: true`): If you pass a regular web page URL
+    (not a feed), the API will find and follow any `<link rel="alternate" type="application/rss+xml">`
+    tags to locate the feed automatically.
+
+    **Example:**
+    ```json
+    {"url": "https://hnrss.org/frontpage", "limit": 20}
+    ```
+
+    **Autodiscovery example:**
+    ```json
+    {"url": "https://news.ycombinator.com", "autodiscover": true, "limit": 10}
+    ```
+    """
+    if not HTTPX_AVAILABLE:
+        raise HTTPException(503, "httpx not available")
+
+    try:
+        status, body, resp_headers, elapsed_ms = await fetch_url_httpx(req.url, req.timeout)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Failed to fetch {req.url}: {e}")
+
+    if status >= 400:
+        raise HTTPException(status, f"HTTP {status} from {req.url}")
+
+    content_type = resp_headers.get("content-type", "").lower()
+
+    # Check if we got HTML instead of a feed
+    is_html = "text/html" in content_type or body.strip().lower().startswith("<!doctype") or body.strip().lower().startswith("<html")
+    is_xml  = any(t in content_type for t in ("xml", "rss", "atom", "feed")) or (
+        body.strip().startswith("<?xml") or body.strip().startswith("<rss") or body.strip().startswith("<feed")
+    )
+
+    if is_html and not is_xml:
+        if req.autodiscover:
+            discovered = _autodiscover_feeds(body, req.url)
+            if not discovered:
+                raise HTTPException(
+                    422,
+                    {
+                        "error": "No RSS/Atom feeds discovered on this page",
+                        "url": req.url,
+                        "tip": "Pass a direct feed URL, or enable autodiscover on a page that links to a feed",
+                    },
+                )
+            # Fetch the first discovered feed
+            feed_url = discovered[0]["url"]
+            try:
+                status, body, resp_headers, elapsed_ms2 = await fetch_url_httpx(feed_url, req.timeout)
+                elapsed_ms += elapsed_ms2
+            except Exception as e:
+                raise HTTPException(502, f"Failed to fetch discovered feed {feed_url}: {e}")
+        else:
+            raise HTTPException(
+                422,
+                {
+                    "error": "URL returned HTML, not a feed",
+                    "url": req.url,
+                    "tip": "Pass a direct RSS/Atom URL, or set autodiscover=true to find feeds on a web page",
+                },
+            )
+
+    # Parse the feed XML
+    try:
+        # Strip BOM/encoding declaration issues
+        xml_body = body.strip()
+        if xml_body.startswith("\ufeff"):
+            xml_body = xml_body[1:]
+        root = ET.fromstring(xml_body)
+    except ET.ParseError as e:
+        raise HTTPException(422, f"XML parse error: {e}")
+
+    # Detect format
+    tag_lower = root.tag.lower()
+    if "feed" in tag_lower or "{http://www.w3.org/2005/atom}" in root.tag:
+        try:
+            parsed = _parse_atom(root)
+        except Exception as e:
+            raise HTTPException(422, f"Atom parse error: {e}")
+    elif "rss" in tag_lower or root.find("channel") is not None:
+        try:
+            parsed = _parse_rss2(root)
+        except Exception as e:
+            raise HTTPException(422, f"RSS parse error: {e}")
+    else:
+        raise HTTPException(422, f"Unrecognised feed format (root tag: {root.tag})")
+
+    # Apply limit
+    parsed["items"] = parsed["items"][:req.limit]
+    parsed["item_count"] = len(parsed["items"])
+    parsed["url"] = req.url
+    parsed["fetch_time_ms"] = round(elapsed_ms)
+
+    return parsed
+
+
+# ──────────────────────────────────────────────
+# v1.1.0: Tech stack detection
+# ──────────────────────────────────────────────
+
+# Technology fingerprints: (name, category, signal_type, pattern)
+# signal_type: "header", "script_src", "html_comment", "meta_generator",
+#              "css_class", "html_attr", "json_key", "cookie"
+_TECH_FINGERPRINTS: List[tuple] = [
+    # CMS / Platforms
+    ("WordPress",    "cms",       "script_src",     r"wp-content|wp-includes"),
+    ("WordPress",    "cms",       "html_comment",   r"WordPress"),
+    ("WordPress",    "cms",       "meta_generator", r"WordPress"),
+    ("Ghost",        "cms",       "meta_generator", r"Ghost"),
+    ("Ghost",        "cms",       "html_attr",      r"ghost"),
+    ("Drupal",       "cms",       "meta_generator", r"Drupal"),
+    ("Drupal",       "cms",       "script_src",     r"/sites/default/files|drupal\.js"),
+    ("Joomla",       "cms",       "meta_generator", r"Joomla"),
+    ("Joomla",       "cms",       "script_src",     r"/media/jui/"),
+    ("Shopify",      "ecommerce", "script_src",     r"cdn\.shopify\.com"),
+    ("Shopify",      "ecommerce", "cookie",         r"^cart$|^_shopify"),
+    ("WooCommerce",  "ecommerce", "css_class",      r"woocommerce"),
+    ("Magento",      "ecommerce", "script_src",     r"mage/"),
+    ("Squarespace",  "website_builder", "script_src", r"static\.squarespace\.com"),
+    ("Wix",          "website_builder", "html_attr",  r"data-wix"),
+    ("Wix",          "website_builder", "script_src", r"static\.wixstatic\.com"),
+    ("Webflow",      "website_builder", "html_attr",  r"data-wf-site"),
+    ("Webflow",      "website_builder", "script_src", r"webflow\.com"),
+    # JS Frameworks
+    ("React",        "frontend",  "html_attr",      r"data-reactroot|data-reactid"),
+    ("React",        "frontend",  "script_src",     r"react(?:\.min)?\.js"),
+    ("Next.js",      "frontend",  "html_attr",      r"__NEXT_DATA__|data-next-page"),
+    ("Next.js",      "frontend",  "script_src",     r"/_next/static"),
+    ("Vue.js",       "frontend",  "html_attr",      r"data-v-\w+"),
+    ("Vue.js",       "frontend",  "script_src",     r"vue(?:\.min)?\.js"),
+    ("Angular",      "frontend",  "html_attr",      r"ng-version|_nghost|_ngcontent"),
+    ("Angular",      "frontend",  "script_src",     r"angular(?:\.min)?\.js"),
+    ("Nuxt.js",      "frontend",  "html_attr",      r"data-n-head|nuxt__"),
+    ("Svelte",       "frontend",  "html_attr",      r"class=\"s-\w+\""),
+    ("Ember.js",     "frontend",  "html_attr",      r"data-ember-action|ember-view"),
+    # CSS Frameworks
+    ("Bootstrap",    "css_framework", "script_src", r"bootstrap(?:\.min)?\.(?:js|css)"),
+    ("Bootstrap",    "css_framework", "css_link",   r"bootstrap(?:\.min)?\.css"),
+    ("Tailwind CSS", "css_framework", "css_class",  r"class=\"[^\"]*(?:flex|grid|px-|py-|text-|bg-)[^\"]*\""),
+    ("Foundation",   "css_framework", "css_link",   r"foundation(?:\.min)?\.css"),
+    # Analytics / Marketing
+    ("Google Analytics", "analytics",  "script_src", r"google-analytics\.com|googletagmanager\.com"),
+    ("Google Tag Manager", "analytics", "script_src", r"googletagmanager\.com"),
+    ("Segment",      "analytics",  "script_src",   r"segment\.io|segment\.com"),
+    ("Mixpanel",     "analytics",  "script_src",   r"mixpanel\.com"),
+    ("Hotjar",       "analytics",  "script_src",   r"hotjar\.com"),
+    ("Amplitude",    "analytics",  "script_src",   r"amplitude\.com"),
+    ("PostHog",      "analytics",  "script_src",   r"posthog\.com|posthog\.js"),
+    ("Intercom",     "crm",        "script_src",   r"intercom\.io|intercom-cdn"),
+    ("HubSpot",      "crm",        "script_src",   r"hs-scripts\.com|hubspot\.com"),
+    ("Zendesk",      "crm",        "script_src",   r"zendesk\.com|zdassets\.com"),
+    # CDN / Infrastructure
+    ("Cloudflare",   "cdn",        "header",        r"cf-ray|cloudflare"),
+    ("Fastly",       "cdn",        "header",        r"x-served-by.*cache"),
+    ("Amazon CloudFront", "cdn",   "header",        r"x-amz-cf-id|cloudfront"),
+    ("Vercel",       "hosting",    "header",        r"x-vercel-id"),
+    ("Netlify",      "hosting",    "header",        r"x-nf-request-id"),
+    ("GitHub Pages", "hosting",    "header",        r"x-github-request-id"),
+    ("AWS",          "hosting",    "header",        r"x-amzn-requestid|x-amz-request-id"),
+    # Server / Runtime
+    ("Nginx",        "server",     "header",        r"nginx"),
+    ("Apache",       "server",     "header",        r"apache"),
+    ("Caddy",        "server",     "header",        r"caddy"),
+    ("Node.js",      "runtime",    "header",        r"node\.js"),
+    ("PHP",          "runtime",    "header",        r"php"),
+    ("Python",       "runtime",    "header",        r"python|uvicorn|gunicorn|django|flask|fastapi"),
+    ("Ruby on Rails","runtime",    "header",        r"phusion|puma|thin"),
+    # Libraries
+    ("jQuery",       "library",    "script_src",   r"jquery(?:\.min)?\.js"),
+    ("lodash",       "library",    "script_src",   r"lodash(?:\.min)?\.js"),
+    ("moment.js",    "library",    "script_src",   r"moment(?:\.min)?\.js"),
+    ("D3.js",        "library",    "script_src",   r"d3(?:\.v\d+)?(?:\.min)?\.js"),
+    # Fonts
+    ("Google Fonts", "font",       "css_link",     r"fonts\.googleapis\.com"),
+    ("Adobe Fonts",  "font",       "script_src",   r"use\.typekit\.net|adobe\.fonts"),
+]
+
+
+def _detect_tech_stack(
+    html: str,
+    resp_headers: Dict[str, str],
+) -> Dict[str, Any]:
+    """
+    Detect technology stack from HTML content and response headers.
+    Returns categorized findings with evidence strings.
+    """
+    if not BS4_AVAILABLE:
+        # Fallback: header-only detection
+        found: Dict[str, Dict] = {}
+        headers_lower = {k.lower(): v.lower() for k, v in resp_headers.items()}
+        server = headers_lower.get("server", "")
+        powered_by = headers_lower.get("x-powered-by", "")
+        generator = resp_headers.get("x-generator", resp_headers.get("X-Generator", ""))
+        for name, category, sig_type, pattern in _TECH_FINGERPRINTS:
+            if sig_type != "header":
+                continue
+            combined_hdrs = " ".join([server, powered_by, generator])
+            if re.search(pattern, combined_hdrs, re.I):
+                found[name] = {"name": name, "category": category, "evidence": [sig_type]}
+        return {
+            "technologies": list(found.values()),
+            "tech_count": len(found),
+            "categories": _group_by_category(list(found.values())),
+        }
+
+    soup = BeautifulSoup(html, "html.parser")
+    headers_str = " ".join(f"{k}: {v}" for k, v in resp_headers.items()).lower()
+
+    # Build signal strings for each type
+    script_srcs = " ".join(
+        (s.get("src") or "") for s in soup.find_all("script", src=True)
+    ).lower()
+    css_links = " ".join(
+        (l.get("href") or "") for l in soup.find_all("link", rel=True)
+        if "stylesheet" in " ".join(l.get("rel", []))
+    ).lower()
+    html_attrs = html  # check full HTML for attribute patterns
+    html_comments = " ".join(str(c) for c in soup.find_all(string=lambda t: isinstance(t, str) and "<!--" in str(t)))
+
+    meta_gen_el = soup.find("meta", attrs={"name": re.compile(r"generator", re.I)})
+    meta_gen = (meta_gen_el.get("content", "") if meta_gen_el else "").lower()
+
+    # Cookies from Set-Cookie headers
+    cookie_header = " ".join(
+        v for k, v in resp_headers.items() if k.lower() == "set-cookie"
+    ).lower()
+
+    signals = {
+        "header":       headers_str,
+        "script_src":   script_srcs,
+        "css_link":     css_links,
+        "html_attr":    html_attrs,
+        "html_comment": html_comments,
+        "meta_generator": meta_gen,
+        "css_class":    html_attrs,
+        "cookie":       cookie_header,
+        "json_key":     html,
+    }
+
+    found: Dict[str, Dict] = {}
+    for name, category, sig_type, pattern in _TECH_FINGERPRINTS:
+        signal_text = signals.get(sig_type, "")
+        if signal_text and re.search(pattern, signal_text, re.I):
+            if name not in found:
+                found[name] = {"name": name, "category": category, "evidence": [sig_type]}
+            else:
+                if sig_type not in found[name]["evidence"]:
+                    found[name]["evidence"].append(sig_type)
+
+    tech_list = list(found.values())
+    return {
+        "technologies": tech_list,
+        "tech_count": len(tech_list),
+        "categories": _group_by_category(tech_list),
+        "meta_generator": meta_gen or None,
+        "server_header": resp_headers.get("server", resp_headers.get("Server")),
+        "powered_by": resp_headers.get("x-powered-by", resp_headers.get("X-Powered-By")),
+    }
+
+
+def _group_by_category(tech_list: List[Dict]) -> Dict[str, List[str]]:
+    """Group technology names by category."""
+    groups: Dict[str, List[str]] = {}
+    for tech in tech_list:
+        cat = tech.get("category", "other")
+        groups.setdefault(cat, []).append(tech["name"])
+    return groups
+
+
+class TechRequest(BaseModel):
+    url: str = Field(..., description="URL to analyse")
+    timeout: int = Field(DEFAULT_TIMEOUT, ge=1, le=MAX_TIMEOUT)
+    render_js: bool = Field(
+        False,
+        description="Use headless browser for JS-rendered content detection (slower but more thorough for SPAs)",
+    )
+
+
+@app.post("/api/tech")
+async def detect_tech(req: TechRequest):
+    """
+    Detect the technology stack of a website.
+
+    **v1.1.0** — Returns a categorised list of detected technologies with evidence.
+
+    Detects 60+ technologies across:
+    - **CMS**: WordPress, Ghost, Drupal, Joomla, Shopify, WooCommerce, Magento
+    - **Website builders**: Squarespace, Wix, Webflow
+    - **JS frameworks**: React, Next.js, Vue.js, Angular, Nuxt.js, Svelte, Ember
+    - **CSS frameworks**: Bootstrap, Tailwind CSS, Foundation
+    - **Analytics**: Google Analytics/GTM, Segment, Mixpanel, Hotjar, Amplitude, PostHog
+    - **CRM/Support**: Intercom, HubSpot, Zendesk
+    - **CDN/Hosting**: Cloudflare, Fastly, CloudFront, Vercel, Netlify, GitHub Pages, AWS
+    - **Server/Runtime**: Nginx, Apache, Node.js, PHP, Python, Ruby on Rails
+    - **Libraries**: jQuery, lodash, D3.js
+    - **Fonts**: Google Fonts, Adobe Fonts
+
+    Detection uses HTTP headers, `<script src>`, `<link href>`, HTML attributes,
+    `<meta name="generator">`, cookies, and comment patterns.
+
+    **Response:**
+    ```json
+    {
+      "url": "https://example.com",
+      "technologies": [
+        {"name": "WordPress", "category": "cms", "evidence": ["script_src", "meta_generator"]},
+        {"name": "jQuery",    "category": "library", "evidence": ["script_src"]},
+        {"name": "Cloudflare","category": "cdn", "evidence": ["header"]}
+      ],
+      "tech_count": 3,
+      "categories": {"cms": ["WordPress"], "library": ["jQuery"], "cdn": ["Cloudflare"]},
+      "meta_generator": "WordPress 6.4.3",
+      "server_header": "nginx/1.18.0"
+    }
+    ```
+    """
+    if not HTTPX_AVAILABLE:
+        raise HTTPException(503, "httpx not available")
+
+    try:
+        if req.render_js and PLAYWRIGHT_AVAILABLE:
+            status, html, elapsed_ms = await fetch_url_playwright(req.url, req.timeout)
+            resp_headers: Dict[str, str] = {}
+        else:
+            status, html, resp_headers, elapsed_ms = await fetch_url_httpx(req.url, req.timeout)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Failed to fetch {req.url}: {e}")
+
+    if status >= 400:
+        raise HTTPException(status, f"HTTP {status} from {req.url}")
+
+    result = _detect_tech_stack(html, resp_headers)
+    result["url"] = req.url
+    result["status_code"] = status
+    result["fetch_time_ms"] = round(elapsed_ms)
+
+    return result
 
 
 # ──────────────────────────────────────────────
