@@ -5,6 +5,15 @@ Built for AI agents that need to consume web pages as clean, structured JSON —
 not raw HTML. Handles JS rendering, content extraction, table parsing, metadata,
 and full Markdown output suitable for feeding directly into language models.
 
+NEW in v1.2.0:
+  - POST /api/sitemap — Parse XML sitemaps into structured URL inventory.
+    Auto-discovers sitemap from robots.txt → /sitemap.xml fallback.
+    Handles sitemap index (nested sitemaps), URL sets with lastmod/changefreq/priority.
+    Returns: urls[], count, sitemap_type, sitemap_url, discovered_at.
+  - POST /api/links  — Deep link extraction with classification.
+    Extracts all <a href> + <link>, classifies as internal/external/email/phone/anchor/resource.
+    Returns: links[], counts by type, unique_external_domains[], nofollow_count, page_title.
+
 NEW in v1.1.0:
   - POST /api/feed — Parse RSS 2.0 and Atom 1.0 feeds into structured JSON items.
     Returns per-item: title, link, pub_date, summary, content, author, guid, media_url.
@@ -13,7 +22,7 @@ NEW in v1.1.0:
     Categories: CMS, JS/CSS frameworks, analytics, CRM, CDN, hosting, server, runtime, libraries.
     Uses: HTTP headers, script/CSS src URLs, HTML attributes, meta generator, cookies.
 
-Version: 1.1.0
+Version: 1.2.0
 """
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -73,7 +82,7 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 app = FastAPI(
     title="Web Intelligence API",
@@ -859,8 +868,21 @@ def root():
             "extract_schema":   "POST /api/extract/schema — heuristic field extraction from natural-language schema",
             "feed":             "POST /api/feed [v1.1] — parse RSS/Atom feeds, with HTML autodiscovery",
             "tech":             "POST /api/tech [v1.1] — detect tech stack (CMS, frameworks, analytics, CDN, server)",
+            "sitemap":          "POST /api/sitemap [v1.2] — parse XML sitemap into URL inventory",
+            "links":            "POST /api/links [v1.2] — extract + classify all links on a page",
             "health":           "GET /health",
         },
+        "new_in_v1_2_0": [
+            "POST /api/sitemap — Parse XML sitemap into a structured URL inventory.",
+            "  Auto-discovers via robots.txt → /sitemap.xml fallback.",
+            "  Handles sitemap index (multiple nested sitemaps) + standard urlset.",
+            "  Each URL includes loc, lastmod, changefreq, priority.",
+            "  Returns: urls[], count, sitemap_type, sitemap_url, child_sitemaps.",
+            "POST /api/links — Deep link extraction with type classification.",
+            "  Extracts all <a href> tags, classifies as internal/external/email/phone/anchor/resource.",
+            "  nofollow: bool, title: from title= attribute, is_image_link: bool.",
+            "  Returns: links[], counts{}, unique_external_domains[], nofollow_count, page_title.",
+        ],
         "new_in_v1_1_0": [
             "POST /api/feed — RSS 2.0 + Atom 1.0 feed parsing. Returns items with title/link/pub_date/summary/author.",
             "  autodiscover=true: follow <link rel=alternate> to find feeds on a regular web page.",
@@ -1686,6 +1708,387 @@ async def detect_tech(req: TechRequest):
     result["url"] = req.url
     result["status_code"] = status
     result["fetch_time_ms"] = round(elapsed_ms)
+
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v1.2.0 — Sitemap Parsing
+# ──────────────────────────────────────────────────────────────────────────────
+
+class SitemapRequest(BaseModel):
+    url: str = Field(
+        ...,
+        description=(
+            "URL to discover sitemap for. Can be:\n"
+            "  - A full sitemap URL: https://example.com/sitemap.xml\n"
+            "  - A domain root: https://example.com — auto-discovers via robots.txt → /sitemap.xml\n"
+            "  - A sitemap index URL — recursively fetches child sitemaps."
+        ),
+    )
+    max_urls: int = Field(
+        500, ge=1, le=5000,
+        description="Maximum total URLs to return (across all child sitemaps).",
+    )
+    include_child_sitemaps: bool = Field(
+        True,
+        description="If a sitemap index is found, fetch and merge child sitemaps.",
+    )
+    timeout: int = Field(DEFAULT_TIMEOUT, ge=5, le=MAX_TIMEOUT)
+
+
+def _parse_sitemap_xml(xml_text: str, base_url: str = "") -> dict:
+    """Parse a single sitemap XML document. Returns {type, urls[], sitemaps[]}."""
+    if not BS4_AVAILABLE:
+        return {"type": "unknown", "urls": [], "sitemaps": []}
+
+    try:
+        soup = BeautifulSoup(xml_text, "lxml-xml")
+    except Exception:
+        try:
+            soup = BeautifulSoup(xml_text, "xml")
+        except Exception:
+            return {"type": "error", "urls": [], "sitemaps": []}
+
+    # Detect sitemap type
+    if soup.find("sitemapindex"):
+        # Sitemap index — list of child sitemaps
+        sitemaps = []
+        for sm in soup.find_all("sitemap"):
+            loc_tag = sm.find("loc")
+            if not loc_tag:
+                continue
+            loc = loc_tag.get_text(strip=True)
+            lastmod_tag = sm.find("lastmod")
+            sitemaps.append({
+                "loc": loc,
+                "lastmod": lastmod_tag.get_text(strip=True) if lastmod_tag else None,
+            })
+        return {"type": "index", "urls": [], "sitemaps": sitemaps}
+
+    elif soup.find("urlset"):
+        # Standard URL set
+        urls = []
+        for url_tag in soup.find_all("url"):
+            loc_tag = url_tag.find("loc")
+            if not loc_tag:
+                continue
+            entry: dict = {"loc": loc_tag.get_text(strip=True)}
+            for field in ("lastmod", "changefreq", "priority"):
+                tag = url_tag.find(field)
+                if tag:
+                    entry[field] = tag.get_text(strip=True)
+            urls.append(entry)
+        return {"type": "urlset", "urls": urls, "sitemaps": []}
+
+    # Fallback: try to find any <loc> tags
+    locs = [t.get_text(strip=True) for t in soup.find_all("loc") if t.get_text(strip=True)]
+    if locs:
+        return {"type": "urlset", "urls": [{"loc": l} for l in locs], "sitemaps": []}
+
+    return {"type": "empty", "urls": [], "sitemaps": []}
+
+
+async def _discover_sitemap_url(domain_url: str, timeout: int) -> str | None:
+    """Try robots.txt first, then /sitemap.xml."""
+    parsed = urllib.parse.urlparse(domain_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+
+    # 1. Check robots.txt for Sitemap: directive
+    robots_url = f"{base}/robots.txt"
+    try:
+        status, text, _, _ = await fetch_url_httpx(robots_url, timeout=timeout)
+        if status == 200:
+            for line in text.splitlines():
+                if line.lower().startswith("sitemap:"):
+                    sm = line.split(":", 1)[1].strip()
+                    if sm:
+                        return sm
+    except Exception:
+        pass
+
+    # 2. Fallback: /sitemap.xml
+    fallback = f"{base}/sitemap.xml"
+    try:
+        status2, _, _, _ = await fetch_url_httpx(fallback, timeout=timeout)
+        if status2 < 400:
+            return fallback
+    except Exception:
+        pass
+
+    return None
+
+
+@app.post("/api/sitemap")
+async def parse_sitemap(req: SitemapRequest):
+    """
+    **v1.2.0 — Parse an XML sitemap into a structured URL inventory.**
+
+    Handles all common sitemap formats:
+    - **Standard** (`urlset`): list of URLs with lastmod, changefreq, priority
+    - **Sitemap index** (`sitemapindex`): nested list of child sitemaps (recursively fetched)
+
+    **Auto-discovery:** If given a domain root (e.g. `https://example.com`), will:
+    1. Check `robots.txt` for `Sitemap:` directive
+    2. Fall back to `/sitemap.xml`
+
+    **Response fields:**
+    - `urls[]`: `{loc, lastmod?, changefreq?, priority?}` — sorted by loc
+    - `count`: total URLs returned (capped at `max_urls`)
+    - `sitemap_type`: `"urlset"`, `"index"`, or `"empty"`
+    - `sitemap_url`: the actual sitemap URL that was fetched
+    - `child_sitemaps[]`: child sitemap URLs (for index sitemaps)
+    """
+    if not HTTPX_AVAILABLE:
+        raise HTTPException(503, "httpx not available")
+
+    t0 = time.monotonic()
+    sitemap_url = req.url
+
+    # Auto-discover if looks like a domain root, not a .xml file
+    if not req.url.lower().endswith(".xml") and not req.url.lower().endswith(".gz"):
+        discovered = await _discover_sitemap_url(req.url, req.timeout)
+        if discovered:
+            sitemap_url = discovered
+        else:
+            raise HTTPException(404, f"No sitemap found for {req.url}. "
+                                     "Try passing the direct sitemap URL, e.g. https://example.com/sitemap.xml")
+
+    try:
+        status, xml_text, _, _ = await fetch_url_httpx(sitemap_url, timeout=req.timeout)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Failed to fetch sitemap: {e}")
+
+    if status >= 400:
+        raise HTTPException(status, f"Sitemap returned HTTP {status}: {sitemap_url}")
+
+    parsed = _parse_sitemap_xml(xml_text, base_url=sitemap_url)
+    all_urls = list(parsed["urls"])
+    child_sitemaps_fetched: list[str] = []
+
+    # For index sitemaps: optionally recurse into children
+    if parsed["type"] == "index" and req.include_child_sitemaps:
+        for child in parsed["sitemaps"]:
+            child_loc = child.get("loc", "")
+            if not child_loc:
+                continue
+            child_sitemaps_fetched.append(child_loc)
+            if len(all_urls) >= req.max_urls:
+                break
+            try:
+                c_status, c_xml, _, _ = await fetch_url_httpx(child_loc, timeout=req.timeout)
+                if c_status < 400:
+                    c_parsed = _parse_sitemap_xml(c_xml)
+                    all_urls.extend(c_parsed["urls"])
+            except Exception:
+                pass
+
+    # Cap results
+    was_truncated = len(all_urls) > req.max_urls
+    all_urls = all_urls[: req.max_urls]
+
+    elapsed = int((time.monotonic() - t0) * 1000)
+    return {
+        "url": req.url,
+        "sitemap_url": sitemap_url,
+        "sitemap_type": parsed["type"],
+        "urls": all_urls,
+        "count": len(all_urls),
+        "was_truncated": was_truncated,
+        "child_sitemaps": child_sitemaps_fetched,
+        "child_sitemaps_count": len(parsed.get("sitemaps", [])),
+        "fetch_time_ms": elapsed,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v1.2.0 — Link Extraction
+# ──────────────────────────────────────────────────────────────────────────────
+
+class LinksRequest(BaseModel):
+    url: str = Field(..., description="URL to extract links from.")
+    include_external: bool = Field(True, description="Include links pointing to other domains.")
+    include_internal: bool = Field(True, description="Include links pointing to the same domain.")
+    include_resources: bool = Field(
+        False,
+        description="Include non-HTML resource links (CSS, JS, images, fonts).",
+    )
+    deduplicate: bool = Field(True, description="Remove duplicate hrefs (keep first occurrence).")
+    max_links: int = Field(
+        500, ge=1, le=5000,
+        description="Maximum number of links to return.",
+    )
+    render_js: bool = Field(False, description="Use headless browser for JS-rendered pages.")
+    timeout: int = Field(DEFAULT_TIMEOUT, ge=5, le=MAX_TIMEOUT)
+
+
+_RESOURCE_EXTS = {
+    ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf", ".pdf", ".zip", ".mp4", ".mp3",
+}
+
+
+def _classify_link(href: str, base_domain: str) -> str:
+    """Classify a href as: internal | external | email | phone | anchor | resource."""
+    if not href or href.startswith("#"):
+        return "anchor"
+    if href.startswith("mailto:"):
+        return "email"
+    if href.startswith("tel:") or href.startswith("sms:"):
+        return "phone"
+    if href.startswith("javascript:"):
+        return "script"
+
+    parsed = urllib.parse.urlparse(href)
+    ext = os.path.splitext(parsed.path)[1].lower()
+    if ext in _RESOURCE_EXTS:
+        return "resource"
+
+    if parsed.netloc:
+        link_domain = parsed.netloc.lower().lstrip("www.")
+        base_clean = base_domain.lower().lstrip("www.")
+        return "internal" if (link_domain == base_clean or link_domain.endswith("." + base_clean)) else "external"
+
+    # Relative path
+    return "internal"
+
+
+def _extract_links_from_html(html: str, base_url: str, req: LinksRequest) -> dict:
+    """Parse HTML and extract all links with classification."""
+    if not BS4_AVAILABLE:
+        return {"links": [], "error": "BeautifulSoup not available"}
+
+    parsed_base = urllib.parse.urlparse(base_url)
+    base_domain = parsed_base.netloc
+
+    soup = BeautifulSoup(html, "lxml")
+    page_title = soup.title.string.strip() if soup.title and soup.title.string else None
+
+    seen_hrefs: set[str] = set()
+    links: list[dict] = []
+    counts: dict[str, int] = {}
+
+    for a in soup.find_all("a", href=True):
+        raw_href = a["href"].strip()
+        if not raw_href:
+            continue
+
+        # Resolve relative URLs
+        abs_href = urllib.parse.urljoin(base_url, raw_href)
+
+        link_type = _classify_link(abs_href, base_domain)
+
+        # Apply filters
+        if link_type == "resource" and not req.include_resources:
+            continue
+        if link_type == "external" and not req.include_external:
+            continue
+        if link_type == "internal" and not req.include_internal:
+            continue
+
+        # Deduplication
+        dedup_key = abs_href if req.deduplicate else f"{abs_href}_{len(links)}"
+        if req.deduplicate and abs_href in seen_hrefs:
+            continue
+        seen_hrefs.add(abs_href)
+
+        rel_attr = a.get("rel", [])
+        if isinstance(rel_attr, str):
+            rel_attr = rel_attr.split()
+        nofollow = "nofollow" in rel_attr
+
+        is_image_link = bool(a.find("img"))
+        link_text = a.get_text(strip=True) or (a.find("img", alt=True) or {}).get("alt", "")
+
+        entry: dict = {
+            "href": abs_href,
+            "text": link_text[:200] if link_text else None,
+            "type": link_type,
+            "nofollow": nofollow,
+        }
+
+        title = a.get("title", "").strip()
+        if title:
+            entry["title"] = title[:200]
+
+        if is_image_link:
+            entry["is_image_link"] = True
+
+        target = a.get("target", "")
+        if target:
+            entry["target"] = target
+
+        links.append(entry)
+        counts[link_type] = counts.get(link_type, 0) + 1
+
+        if len(links) >= req.max_links:
+            break
+
+    # Unique external domains
+    external_domains: list[str] = sorted({
+        urllib.parse.urlparse(lk["href"]).netloc
+        for lk in links
+        if lk["type"] == "external" and urllib.parse.urlparse(lk["href"]).netloc
+    })
+
+    nofollow_count = sum(1 for lk in links if lk.get("nofollow"))
+
+    return {
+        "links": links,
+        "counts": counts,
+        "total": len(links),
+        "unique_external_domains": external_domains,
+        "nofollow_count": nofollow_count,
+        "page_title": page_title,
+        "was_truncated": len(links) >= req.max_links,
+    }
+
+
+@app.post("/api/links")
+async def extract_links(req: LinksRequest):
+    """
+    **v1.2.0 — Extract and classify all links from a webpage.**
+
+    Returns every `<a href>` on the page, classified as:
+    - `internal` — same domain (including subdomains)
+    - `external` — different domain
+    - `email` — `mailto:` links
+    - `phone` — `tel:` / `sms:` links
+    - `anchor` — `#fragment` links (same-page jumps)
+    - `resource` — direct links to CSS/JS/image/PDF files (opt-in via `include_resources`)
+
+    **Response fields:**
+    - `links[]`: `{href, text, type, nofollow, title?, target?, is_image_link?}`
+    - `counts{}`: count per link type
+    - `unique_external_domains[]`: sorted list of distinct external domains linked to
+    - `nofollow_count`: links with rel="nofollow" (useful for SEO analysis)
+    - `page_title`: title of the page
+
+    Set `render_js=true` for React/Vue/Angular pages that load links dynamically.
+    """
+    if not HTTPX_AVAILABLE:
+        raise HTTPException(503, "httpx not available")
+
+    t0 = time.monotonic()
+    try:
+        if req.render_js and PLAYWRIGHT_AVAILABLE:
+            status, html, elapsed_ms = await fetch_url_playwright(req.url, req.timeout)
+        else:
+            status, html, _, elapsed_ms = await fetch_url_httpx(req.url, req.timeout)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Failed to fetch {req.url}: {e}")
+
+    if status >= 400:
+        raise HTTPException(status, f"HTTP {status} from {req.url}")
+
+    result = _extract_links_from_html(html, req.url, req)
+    result["url"] = req.url
+    result["status_code"] = status
+    result["fetch_time_ms"] = round((time.monotonic() - t0) * 1000)
 
     return result
 
